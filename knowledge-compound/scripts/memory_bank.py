@@ -1,23 +1,44 @@
 #!/usr/bin/env python3
 """
-知识复利引擎 - 记忆存储和检索脚本
+知识复利引擎 v3.0 — 记忆存储、检索、分析和管理脚本
 
-使用方式（被 SOLO 调用，用户无需直接操作）：
-  python3 memory_bank.py store <内容> --type <类型> --context <上下文> --tags <标签>
-  python3 memory_bank.py recall <关键词>
-  python3 memory_bank.py list [--limit N]
-  python3 memory_bank.py search <关键词>
-  python3 memory_bank.py delete <记忆ID>
-  python3 memory_bank.py export
-  python3 memory_bank.py cleanup
+命令：
+  store    保存一条记忆
+  recall   检索相关记忆
+  list     列出最近记忆
+  search   搜索记忆
+  delete   删除记忆
+  export   导出记忆为 Markdown
+  cleanup  清理长期未访问的记忆
+  stats    记忆库统计
+  dashboard 可视化仪表盘
+  weekly   生成周报
+  relation 发现记忆之间的关联
 """
 
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 MEMORY_DIR = Path(__file__).parent.parent / ".knowledge-compound"
 MEMORY_FILE = MEMORY_DIR / "memory-bank.json"
+
+TYPE_LABELS = {
+    "preference": "偏好",
+    "decision": "决策",
+    "project": "项目背景",
+    "lesson": "经验教训",
+    "fact": "知识点",
+}
+
+TYPE_ICONS = {
+    "preference": "🎯",
+    "decision": "✅",
+    "project": "📦",
+    "lesson": "💡",
+    "fact": "📖",
+}
 
 
 def _ensure_memory_file():
@@ -64,6 +85,70 @@ def _similarity(a, b):
     return len(intersection) / max(len(a_words), len(b_words))
 
 
+def _discover_relations(memories):
+    relations = []
+    for i, a in enumerate(memories):
+        for j, b in enumerate(memories):
+            if j <= i:
+                continue
+            score = 0
+            a_words = set(a.get("content", "").lower().split())
+            b_words = set(b.get("content", "").lower().split())
+            word_overlap = a_words & b_words
+            if len(word_overlap) >= 3:
+                score += len(word_overlap)
+            a_tags = set(t.lower() for t in a.get("tags", []))
+            b_tags = set(t.lower() for t in b.get("tags", []))
+            tag_overlap = a_tags & b_tags
+            if tag_overlap:
+                score += len(tag_overlap) * 2
+            if a.get("type") == "project" or b.get("type") == "project":
+                shared = word_overlap - {"这个", "项目", "一个", "的", "了", "是", "我", "用"}
+                if len(shared) >= 2:
+                    score += 2
+            common_words = word_overlap - {"这个", "项目", "一个", "的", "了", "是", "我", "用", "在", "有", "和", "就", "也", "都", "要", "会", "可以", "因为", "所以", "但是", "如果"}
+            if len(common_words) >= 2:
+                score += 1
+            if score >= 3:
+                relations.append({
+                    "id_a": a["id"],
+                    "id_b": b["id"],
+                    "content_a": a["content"],
+                    "content_b": b["content"],
+                    "strength": min(score / 5, 1.0),
+                    "common_words": list(common_words),
+                })
+    relations.sort(key=lambda r: -r["strength"])
+    return relations
+
+
+def _knowledge_compound_index(memories):
+    if not memories:
+        return 0, 0
+    total = len(memories)
+    relations = _discover_relations(memories)
+    relation_score = min(len(relations) * 5, 30)
+    diversity = len(set(m.get("type", "unknown") for m in memories)) * 5
+    access_total = sum(m.get("access_count", 0) for m in memories)
+    access_score = min(access_total / total * 2, 20)
+    kci = min(relation_score + diversity + access_score + 10, 100)
+    saved_hours = round(access_total * 0.05, 1)
+    return kci, saved_hours
+
+
+def _stars_from_score(score):
+    if score >= 80:
+        return "★★★★★"
+    elif score >= 60:
+        return "★★★★☆"
+    elif score >= 40:
+        return "★★★☆☆"
+    elif score >= 20:
+        return "★★☆☆☆"
+    else:
+        return "★☆☆☆☆"
+
+
 def cmd_store(args):
     if not args.content:
         print("错误：请提供要记忆的内容")
@@ -90,12 +175,35 @@ def cmd_store(args):
     }
     memories.append(mem)
     _write_memories(memories)
-    print(f"记忆已保存：{mem['id']} ({mem['type']})")
+    new_relations = _discover_relations(memories)
+    print(f"记忆已保存：{mem['id']} ({TYPE_LABELS.get(mem['type'], mem['type'])})")
+    fresh_rels = [r for r in new_relations if r["id_a"] == mem["id"] or r["id_b"] == mem["id"]]
+    if fresh_rels:
+        print(f"🔗 发现 {len(fresh_rels)} 条关联：")
+        for r in fresh_rels[:3]:
+            other = r["content_b"] if r["id_a"] == mem["id"] else r["content_a"]
+            print(f"   关联到「{other[:40]}...」")
 
 
 def cmd_recall(args):
     query = args.content or ""
     if not query.strip():
+        memories = _read_memories()
+        if memories:
+            memories.sort(key=lambda m: (m.get("access_count", 0), m.get("last_accessed", "")), reverse=True)
+            results = memories[: args.limit or 5]
+            print(f"活跃记忆（共 {len(memories)} 条）：\n")
+            for m in results:
+                icon = TYPE_ICONS.get(m.get("type", ""), "📌")
+                print(f"  {icon} [{m['id']}] {m['content']}")
+                if m.get("context"):
+                    print(f"      上下文：{m['context']}")
+                tags_str = ", ".join(m.get("tags", []))
+                if tags_str:
+                    print(f"      标签：{tags_str}")
+                print(f"      引用 {m.get('access_count', 0)} 次 | 记录于 {m['created']}")
+                print()
+            return
         print("提示：请提供关键词来检索相关记忆")
         return
     memories = _read_memories()
@@ -127,7 +235,8 @@ def cmd_recall(args):
         return
     print(f"找到 {len(results)} 条相关记忆：\n")
     for score, m in results:
-        print(f"  [{m['id']}] ({m['type']}) {m['content']}")
+        icon = TYPE_ICONS.get(m.get("type", ""), "📌")
+        print(f"  {icon} [{m['id']}] ({TYPE_LABELS.get(m['type'], m['type'])}) {m['content']}")
         if m.get("context"):
             print(f"      上下文：{m['context']}")
         tags_str = ", ".join(m.get("tags", []))
@@ -150,9 +259,10 @@ def cmd_list(args):
     shown = memories[:limit]
     print(f"最近 {len(shown)} 条记忆（共 {len(memories)} 条）：\n")
     for m in shown:
+        icon = TYPE_ICONS.get(m.get("type", ""), "📌")
         tags_str = ", ".join(m.get("tags", [])) if m.get("tags") else ""
         tag_info = f" [{tags_str}]" if tags_str else ""
-        print(f"  [{m['id']}] ({m['type']}) {m['content']}{tag_info}")
+        print(f"  {icon} [{m['id']}] ({TYPE_LABELS.get(m['type'], m['type'])}) {m['content']}{tag_info}")
         print(f"      记录于 {m['created']}，上次访问 {m.get('last_accessed', '未知')}")
         print()
 
@@ -192,7 +302,8 @@ def cmd_export(args):
         "",
     ]
     for m in memories:
-        lines.append(f"## [{m['id']}] ({m['type']})")
+        icon = TYPE_ICONS.get(m.get("type", ""), "📌")
+        lines.append(f"## {icon} [{m['id']}] ({TYPE_LABELS.get(m['type'], m['type'])})")
         lines.append(f"")
         lines.append(f"**内容**：{m['content']}")
         if m.get("context"):
@@ -229,10 +340,10 @@ def cmd_stats(args):
     if not memories:
         print("记忆库为空。")
         return
-    type_counts = {}
+    type_counts = defaultdict(int)
     for m in memories:
         t = m.get("type", "unknown")
-        type_counts[t] = type_counts.get(t, 0) + 1
+        type_counts[t] += 1
     total = len(memories)
     avg_access = sum(m.get("access_count", 0) for m in memories) / total
     print(f"📊 记忆库统计")
@@ -240,9 +351,164 @@ def cmd_stats(args):
     print(f"  总记忆数：{total}")
     print(f"  按类型：")
     for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
-        print(f"    {t}: {c} 条")
+        label = TYPE_LABELS.get(t, t)
+        icon = TYPE_ICONS.get(t, "📌")
+        pct = c / total * 100
+        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        print(f"    {icon} {label}: {c} 条 {bar}")
     print(f"  平均引用次数：{avg_access:.1f}")
     print(f"  存储位置：{MEMORY_FILE}")
+
+
+def cmd_dashboard(args):
+    memories = _read_memories()
+    if not memories:
+        print("记忆库为空。开始使用吧，我会自动记住重要信息！")
+        return
+    total = len(memories)
+    type_counts = defaultdict(int)
+    for m in memories:
+        type_counts[m.get("type", "unknown")] += 1
+    relations = _discover_relations(memories)
+    total_relations = len(relations)
+    total_access = sum(m.get("access_count", 0) for m in memories)
+    avg_access = total_access / total
+    kci, saved_hours = _knowledge_compound_index(memories)
+    stars = _stars_from_score(kci)
+    print(f"╔{'═'*35}╗")
+    print(f"║   知识复利引擎 · 仪表盘{' ' * 13}║")
+    print(f"╠{'═'*35}╣")
+    print(f"║  🧠 记忆总数       {total:>4} 条{' ' * 12}║")
+    for t in ["preference", "decision", "project", "lesson", "fact"]:
+        c = type_counts.get(t, 0)
+        label = TYPE_LABELS.get(t, t)
+        icon = TYPE_ICONS.get(t, "📌")
+        bar = "█" * min(c, 20) + "░" * max(0, 20 - min(c, 20))
+        short_bar = bar[:min(c, 30) or 1]
+        print(f"║  {icon} {label:<8s} {c:>4} 条 {short_bar}{' ' * 4}║")
+    print(f"║{' ' * 35}║")
+    print(f"║  🔗 关联发现       {total_relations:>4} 组{' ' * 12}║")
+    print(f"║  📈 知识复利指数   {stars}{' ' * (18 - len(stars))}║")
+    print(f"║  ⏱ 节省重复解释 ≈ {saved_hours:>4.1f}h{' ' * 12}║")
+    print(f"╚{'═'*35}╝")
+    if total_relations > 0:
+        print(f"\n🔗 最强关联 TOP 3：")
+        for r in relations[:3]:
+            print(f"  · 「{r['content_a'][:28]}...」")
+            print(f"    ↔ 「{r['content_b'][:28]}...」")
+    print(f"\n📊 记忆类型分布：")
+    for t in ["preference", "decision", "project", "lesson", "fact"]:
+        c = type_counts.get(t, 0)
+        if c > 0:
+            label = TYPE_LABELS.get(t, t)
+            icon = TYPE_ICONS.get(t, "📌")
+            pct = c / total * 100
+            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            print(f"  {icon} {label:<8s} {bar} {c}条 ({pct:.0f}%)")
+
+
+def cmd_weekly(args):
+    memories = _read_memories()
+    if not memories:
+        print("记忆库为空，无法生成周报。")
+        return
+    today = date.today()
+    week_ago = (today - timedelta(days=7)).isoformat()
+    new_this_week = [m for m in memories if m.get("created", "") >= week_ago]
+    accessed_this_week = [m for m in memories if m.get("last_accessed", "") >= week_ago]
+    total = len(memories)
+    total_access = sum(m.get("access_count", 0) for m in memories)
+    kci, saved_hours = _knowledge_compound_index(memories)
+    stars = _stars_from_score(kci)
+    type_counts = defaultdict(int)
+    for m in new_this_week:
+        type_counts[m.get("type", "unknown")] += 1
+    relations = _discover_relations(memories)
+    report_path = MEMORY_DIR / f"weekly-{today.isoformat()}.md"
+    lines = [
+        f"# 📊 知识复利引擎 · 周报",
+        f"",
+        f"> 报告周期：{week_ago} ~ {today.isoformat()}",
+        f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"",
+        f"---",
+        f"",
+        f"## 📈 本周概览",
+        f"",
+        f"| 指标 | 数值 |",
+        f"|------|------|",
+        f"| 记忆总数 | {total} 条 |",
+        f"| 本周新增 | {len(new_this_week)} 条 |",
+        f"| 本周引用 | {len(accessed_this_week)} 条被访问 |",
+        f"| 关联发现 | {len(relations)} 组 |",
+        f"| 知识复利指数 | {stars} ({kci}/100) |",
+        f"| 累计节省时间 | ≈ {saved_hours}h |",
+        f"",
+    ]
+    if new_this_week:
+        lines.append(f"## 🆕 本周新增记忆")
+        lines.append(f"")
+        for t in ["preference", "decision", "project", "lesson", "fact"]:
+            c = type_counts.get(t, 0)
+            if c > 0:
+                label = TYPE_LABELS.get(t, t)
+                icon = TYPE_ICONS.get(t, "📌")
+                lines.append(f"- {icon} {label}: {c} 条")
+        lines.append(f"")
+        lines.append(f"### 详细信息")
+        lines.append(f"")
+        for m in new_this_week:
+            icon = TYPE_ICONS.get(m.get("type", ""), "📌")
+            lines.append(f"- {icon} {m['content']}")
+            if m.get("tags"):
+                lines.append(f"  - 标签：{', '.join(m['tags'])}")
+            lines.append(f"")
+    if relations:
+        lines.append(f"## 🔗 知识关联发现")
+        lines.append(f"")
+        lines.append(f"你的记忆之间形成了 {len(relations)} 组关联：")
+        lines.append(f"")
+        for r in relations[:5]:
+            lines.append(f"- 「{r['content_a'][:30]}...」 ↔ 「{r['content_b'][:30]}...」")
+        lines.append(f"")
+    lines.append(f"## 💪 知识复利效应")
+    lines.append(f"")
+    lines.append(f"- 当前知识复利指数：**{stars}**（{kci}/100）")
+    lines.append(f"- 累计为你节省了约 **{saved_hours}h** 的重复解释时间")
+    lines.append(f"- 平均每条记忆被引用 **{total_access / max(total, 1):.1f}** 次")
+    lines.append(f"- 知识库中有 **{len(relations)}** 组关联关系等待挖掘")
+    lines.append(f"")
+    lines.append(f"---")
+    lines.append(f"")
+    lines.append(f"*知识复利引擎自动生成 · 数据仅存储在你本地*")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"📊 周报已生成：{report_path}")
+    print(f"   你可以直接分享这个 Markdown 文件！")
+    print(f"\n📈 本周摘要：")
+    print(f"   记忆总数 {total} 条 | 本周新增 {len(new_this_week)} 条")
+    print(f"   知识复利指数 {stars} | 节省 ≈ {saved_hours}h")
+
+
+def cmd_relation(args):
+    memories = _read_memories()
+    if not memories:
+        print("记忆库为空。")
+        return
+    relations = _discover_relations(memories)
+    if not relations:
+        print("未发现记忆之间的关联。继续使用，积累更多记忆后会自动发现关联。")
+        return
+    limit = args.limit or 10
+    print(f"🔗 发现 {len(relations)} 组记忆关联：\n")
+    for r in relations[:limit]:
+        strength_bar = "█" * int(r["strength"] * 10) + "░" * (10 - int(r["strength"] * 10))
+        print(f"  关联强度：{strength_bar} ({r['strength']:.0%})")
+        print(f"  ├─ [{r['id_a']}] {r['content_a'][:50]}")
+        print(f"  └─ [{r['id_b']}] {r['content_b'][:50]}")
+        if r.get("common_words"):
+            print(f"     共同关键词：{', '.join(r['common_words'][:5])}")
+        print()
 
 
 def main():
@@ -252,12 +518,12 @@ def main():
 
     p_store = sub.add_parser("store", help="保存一条记忆")
     p_store.add_argument("content", nargs="?", help="记忆内容")
-    p_store.add_argument("--type", default="fact", help="记忆类型：preference/decision/fact/project/lesson")
+    p_store.add_argument("--type", default="fact", choices=list(TYPE_LABELS.keys()), help="记忆类型")
     p_store.add_argument("--context", default="", help="产生记忆的上下文")
     p_store.add_argument("--tags", default="", help="逗号分隔的标签")
 
     p_recall = sub.add_parser("recall", help="检索相关记忆")
-    p_recall.add_argument("content", nargs="?", help="检索关键词")
+    p_recall.add_argument("content", nargs="?", help="检索关键词（不填则显示活跃记忆）")
     p_recall.add_argument("--limit", type=int, default=5, help="返回条数上限")
 
     p_list = sub.add_parser("list", help="列出最近记忆")
@@ -274,6 +540,11 @@ def main():
     sub.add_parser("cleanup", help="清理长期未访问的记忆")
     sub.add_parser("stats", help="记忆库统计")
 
+    p_dash = sub.add_parser("dashboard", help="显示可视化仪表盘")
+    p_weekly = sub.add_parser("weekly", help="生成周报")
+    p_rel = sub.add_parser("relation", help="发现记忆之间的关联")
+    p_rel.add_argument("--limit", type=int, default=10, help="显示条数")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -287,6 +558,9 @@ def main():
         "export": cmd_export,
         "cleanup": cmd_cleanup,
         "stats": cmd_stats,
+        "dashboard": cmd_dashboard,
+        "weekly": cmd_weekly,
+        "relation": cmd_relation,
     }
     cmd_map[args.command](args)
 
